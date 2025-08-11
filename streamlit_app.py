@@ -131,7 +131,8 @@ with cE:
     join_tol_s = st.number_input("Join tolerance (seconds)", min_value=0, value=60, step=5)
 
 with st.expander("Advanced settings"):
-    bias_watts = st.number_input("Bias margin (subtract W from curve)", value=0.0, step=10.0)
+    bias_watts = st.number_input("Bias margin (subtract W from targets & refit)", value=0.0, step=10.0, help="Refits to P' = max(P - bias, 0). Produces new a,b.")
+    st.caption("Bias reduces predictions on purpose; expect lower R² vs original P.")
 
 st.caption("Valid points: P ≥ Pmin, I ≥ Imin, and P ≤ (clip × Pmax). Timestamps aligned by nearest within tolerance.")
 
@@ -179,6 +180,15 @@ if ready:
         r2 = 1 - (sse/sst) if sst > 0 else np.nan
         return a, b, r2
 
+    def _spearman_rho(x, y):
+        # simple Spearman ρ via ranks + Pearson
+        xr = pd.Series(x).rank(method="average").to_numpy()
+        yr = pd.Series(y).rank(method="average").to_numpy()
+        if xr.size < 3: return np.nan
+        xm = xr - xr.mean(); ym = yr - yr.mean()
+        denom = np.sqrt((xm*xm).sum() * (ym*ym).sum())
+        return float((xm*ym).sum()/denom) if denom > 0 else np.nan
+
     # ---- Lag compensation ----
     st.markdown("### Lag compensation")
     cLag1, cLag2, cLag3 = st.columns(3)
@@ -188,38 +198,48 @@ if ready:
         max_lag_s = st.number_input("Max lag search (seconds)", min_value=0, value=120, step=5)
     with cLag3:
         manual_lag_s = st.number_input("Manual lag (seconds, + = plant delayed)", value=0, step=1)
+    metric = st.selectbox("Lag optimize metric", ["R² (midrange quadratic)", "Spearman ρ (midrange)"])
 
     best_lag = manual_lag_s
     if auto_lag:
         lags = np.arange(-max_lag_s, max_lag_s + 1, 5)  # 5s step
-        best_r2 = -np.inf
+        best_score = -np.inf
         for lag in lags:
             shifted = plant.copy()
             shifted["t"] = shifted["t"] + pd.to_timedelta(lag, unit="s")
-            temp_join = pd.merge_asof(
+            temp = pd.merge_asof(
                 ref, shifted, on="t", direction="nearest",
                 tolerance=pd.Timedelta(seconds=int(join_tol_s))
             ).dropna(subset=["P", "I"])
 
             # Hard filters (avoid sleep and clipping)
-            temp_join = temp_join[
-                (temp_join["P"] >= p_min) &
-                (temp_join["I"] >= i_min) &
-                (temp_join["P"] <= clip_frac * p_max)
+            temp = temp[
+                (temp["P"] >= p_min) &
+                (temp["I"] >= i_min) &
+                (temp["P"] <= clip_frac * p_max)
             ]
+            if len(temp) <= 3:
+                continue
 
-            if len(temp_join) > 3:
-                # Focus on mid-range current to avoid extremes
-                q20, q80 = temp_join["I"].quantile(0.2), temp_join["I"].quantile(0.8)
-                mid = temp_join[temp_join["I"].between(q20, q80)]
-                if len(mid) > 3:
-                    _, _, r2 = quad_fit_through_origin(mid["I"], mid["P"])
-                else:
-                    _, _, r2 = quad_fit_through_origin(temp_join["I"], temp_join["P"])
-                if np.isfinite(r2) and r2 > best_r2:
-                    best_r2 = r2
-                    best_lag = lag
-        st.caption(f"Auto-detected lag: {best_lag} s (R² {best_r2:.3f})")
+            # Midrange window to avoid extremes
+            q20, q80 = temp["I"].quantile(0.20), temp["I"].quantile(0.80)
+            mid = temp[temp["I"].between(q20, q80)]
+            if len(mid) <= 3:
+                mid = temp
+
+            if metric.startswith("R²"):
+                _, _, r2_mid = quad_fit_through_origin(mid["I"], mid["P"])
+                score = r2_mid if np.isfinite(r2_mid) else -np.inf
+            else:
+                rho = _spearman_rho(mid["I"], mid["P"])
+                score = rho if np.isfinite(rho) else -np.inf
+
+            if score > best_score:
+                best_score = score
+                best_lag = lag
+
+        label = "R²" if metric.startswith("R²") else "Spearman ρ"
+        st.caption(f"Auto-detected lag: {best_lag} s ({label} {best_score:.3f})")
 
     # Apply lag before join
     plant["t"] = plant["t"] + pd.to_timedelta(best_lag, unit="s")
@@ -236,12 +256,22 @@ if ready:
     joined["valid"] = ~(joined["sleep"] | joined["clip"])
     valid = joined.loc[joined["valid"]].copy()
 
-    # ---- Fit results ----
+    # ---- Fit: un-biased vs biased ----
+    # Un-biased fit against actual P
     a_q, b_q, r2_quad = quad_fit_through_origin(valid["I"].values, valid["P"].values)
 
-    # Biased fit curve
-    def biased_curve(I):
-        return np.maximum(0, (a_q * I + b_q * (I ** 2)) - bias_watts)
+    # Biased target: push curve down, then refit => new coefficients a_b, b_b
+    P_target = np.maximum(valid["P"].values - float(bias_watts), 0.0)
+    a_b, b_b, r2_b_target = quad_fit_through_origin(valid["I"].values, P_target)
+
+    # Evaluate biased model against original P, too (expect lower R² by design)
+    if np.isfinite(a_b) and np.isfinite(b_b) and len(valid) > 0:
+        P_hat_b_on_P = a_b*valid["I"].values + b_b*(valid["I"].values**2)
+        sst = float(((valid["P"].values - valid["P"].values.mean())**2).sum())
+        sse = float(((valid["P"].values - P_hat_b_on_P)**2).sum())
+        r2_b_on_P = 1 - (sse/sst) if sst > 0 else np.nan
+    else:
+        r2_b_on_P = np.nan
 
     # Zero-intercept linear reference
     sumPI = float((valid["P"] * valid["I"]).sum()) if len(valid) > 0 else 0.0
@@ -269,22 +299,38 @@ if ready:
     if len(valid) < 50:
         st.warning("Very few valid points (<50). Quadratic may be unreliable—collect a longer or more varied window.")
 
-    q1, q2, q3 = st.columns(3)
-    q1.write("**a (W/A)**"); q1.subheader(f"{a_q:,.3f}" if np.isfinite(a_q) else "—")
-    q2.write("**b (W/A²)**"); q2.subheader(f"{b_q:,.3f}" if np.isfinite(b_q) else "—")
-    q3.caption(f"R² (quadratic): {r2_quad:.3f}" if np.isfinite(r2_quad) else "R²: —")
+    # Coefficients + metrics
+    cfit1, cfit2 = st.columns(2)
+    with cfit1:
+        st.write("**Un-biased quadratic (P ≈ a·I + b·I²)**")
+        st.write(f"a = {a_q:,.3f} W/A")
+        st.write(f"b = {b_q:,.3f} W/A²")
+        st.caption(f"R² on P: {r2_quad:.3f}" if np.isfinite(r2_quad) else "R² on P: —")
+    with cfit2:
+        st.write("**Biased quadratic (fit to P' = max(P − bias, 0))**")
+        st.write(f"a_b = {a_b:,.3f} W/A" if np.isfinite(a_b) else "a_b = —")
+        st.write(f"b_b = {b_b:,.3f} W/A²" if np.isfinite(b_b) else "b_b = —")
+        st.caption(
+            (f"R² on target P': {r2_b_target:.3f}; R² on original P: {r2_b_on_P:.3f}")
+            if np.isfinite(r2_b_target) else "R²: —"
+        )
 
-    kcol = st.columns(1)[0]
-    kcol.caption(f"Linear reference k: {k_zero:,.3f} W/A (R² {r2_zero:.3f})" if np.isfinite(k_zero) else "Linear reference k: —")
-
-    st.markdown("#### Home Assistant snippet (quadratic with bias)")
-    if np.isfinite(a_q) and np.isfinite(b_q):
+    st.markdown("#### Home Assistant snippet (biased coefficients)")
+    if np.isfinite(a_b) and np.isfinite(b_b):
         st.code(
+f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
+{{% set a = {a_b:.6f} %}}
+{{% set b = {b_b:.6f} %}}
+{{% set p = a*isc + b*isc*isc %}}
+{{{{ (0 if p < 0 else p) | round(0) }}}}""", language="jinja2")
+    else:
+        st.caption("Not enough valid data for biased coefficients; showing un-biased snippet instead.")
+        if np.isfinite(a_q) and np.isfinite(b_q):
+            st.code(
 f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
 {{% set a = {a_q:.6f} %}}
 {{% set b = {b_q:.6f} %}}
-{{% set bias = {bias_watts:.1f} %}}
-{{% set p = (a*isc + b*isc*isc) - bias %}}
+{{% set p = a*isc + b*isc*isc %}}
 {{{{ (0 if p < 0 else p) | round(0) }}}}""", language="jinja2")
 
     st.markdown("---")
@@ -298,15 +344,13 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
         ax1.scatter(joined.loc[~joined["valid"], "I"], joined.loc[~joined["valid"], "P"], s=12, marker="x", label="sleep/clip")
     ax1.axhline(clip_limit, linestyle="--", linewidth=1)
     ax1.set_xlabel("Isc (A)"); ax1.set_ylabel("Power (W)")
-    # overlay linear & quadratic fits
-    if np.isfinite(k_zero) and len(valid) > 0:
-        xs_lin = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 2)
-        ax1.plot(xs_lin, k_zero * xs_lin, linewidth=2, label="linear fit")
+    # overlay fits
     if np.isfinite(a_q) and np.isfinite(b_q) and len(valid) > 0:
         xi = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 200)
-        ax1.plot(xi, a_q * xi + b_q * (xi ** 2), linewidth=2, label="quadratic fit")
-        if bias_watts > 0:
-            ax1.plot(xi, biased_curve(xi), linewidth=2, linestyle="--", color="orange", label=f"biased fit (-{bias_watts} W)")
+        ax1.plot(xi, a_q*xi + b_q*(xi**2), linewidth=2, label="quadratic fit")
+    if np.isfinite(a_b) and np.isfinite(b_b) and len(valid) > 0:
+        xi = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 200)
+        ax1.plot(xi, a_b*xi + b_b*(xi**2), linewidth=2, linestyle="--", label=f"biased fit (targets −{bias_watts:.0f} W)")
     ax1.legend()
     st.pyplot(fig1)
 
