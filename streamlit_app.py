@@ -147,78 +147,27 @@ if ready:
 
     ref = ref.sort_values("t")
     plant = plant.sort_values("t")
-    if "t" in ref and pd.api.types.is_datetime64_any_dtype(ref["t"]):
+    if pd.api.types.is_datetime64_any_dtype(ref["t"]):
         ref["t"] = ref["t"].dt.tz_localize(None)
-    if "t" in plant and pd.api.types.is_datetime64_any_dtype(plant["t"]):
+    if pd.api.types.is_datetime64_any_dtype(plant["t"]):
         plant["t"] = plant["t"].dt.tz_localize(None)
 
-# ---- Time lag / jitter handling ----
-st.markdown("### Lag compensation")
-cLag1, cLag2, cLag3 = st.columns(3)
-with cLag1:
-    auto_lag = st.checkbox("Auto-detect lag", value=True)
-with cLag2:
-    max_lag_s = st.number_input("Max lag search (seconds)", min_value=0, value=120, step=5)
-with cLag3:
-    manual_lag_s = st.number_input("Manual lag (seconds, + = plant delayed)", value=0, step=1)
-
-best_lag = manual_lag_s
-if auto_lag:
-    # brute-force lag search
-    lags = np.arange(-max_lag_s, max_lag_s+1, 5)  # 5s steps
-    best_r2 = -np.inf
-    for lag in lags:
-        shifted = plant.copy()
-        shifted["t"] = shifted["t"] + pd.to_timedelta(lag, unit="s")
-        temp_join = pd.merge_asof(ref, shifted, on="t", direction="nearest",
-                                  tolerance=pd.Timedelta(seconds=int(join_tol_s)))
-        temp_join = temp_join.dropna(subset=["P", "I"]).copy()
-        temp_join = temp_join[(temp_join["P"] >= p_min) &
-                              (temp_join["I"] >= i_min) &
-                              (temp_join["P"] <= clip_frac*p_max)]
-        if len(temp_join) > 3:
-            _, _, r2 = quad_fit_through_origin(temp_join["I"], temp_join["P"])
-            if np.isfinite(r2) and r2 > best_r2:
-                best_r2 = r2
-                best_lag = lag
-    st.caption(f"Auto-detected lag: {best_lag} s (R² {best_r2:.3f})")
-
-# apply lag before join
-plant["t"] = plant["t"] + pd.to_timedelta(best_lag, unit="s")
-    
-    tol = pd.Timedelta(seconds=int(join_tol_s))
-    joined = pd.merge_asof(ref, plant, on="t", direction="nearest", tolerance=tol)
-    joined = joined.dropna(subset=["P", "I"]).copy()
-
-    if len(joined) > 0:
-        t0, t1 = joined["t"].iloc[0], joined["t"].iloc[-1]
-        overlap_min = (t1 - t0).total_seconds() / 60.0
-    else:
-        t0 = t1 = None
-        overlap_min = 0.0
-
-    clip_limit = clip_frac * float(p_max)
-    joined["sleep"] = (joined["P"] < float(p_min)) | (joined["I"] < float(i_min))
-    joined["clip"]  = (float(p_max) > 0) & (joined["P"] > clip_limit)
-    joined["valid"] = ~(joined["sleep"] | joined["clip"])
-    valid = joined.loc[joined["valid"]].copy()
-
-    # ---- Quadratic (through-origin): P ≈ a*I + b*I^2 ----
+    # ---- Quadratic fit helper ----
     def quad_fit_through_origin(I, P):
         I = np.asarray(I); P = np.asarray(P)
         if len(I) < 3:
             return np.nan, np.nan, np.nan
         x1 = I
         x2 = I**2
-        S11 = float(np.dot(x1, x1))        # sum I^2
-        S12 = float(np.dot(x1, x2))        # sum I^3
-        S22 = float(np.dot(x2, x2))        # sum I^4
-        T1  = float(np.dot(P,  x1))        # sum P*I
-        T2  = float(np.dot(P,  x2))        # sum P*I^2
+        S11 = float(np.dot(x1, x1))
+        S12 = float(np.dot(x1, x2))
+        S22 = float(np.dot(x2, x2))
+        T1  = float(np.dot(P,  x1))
+        T2  = float(np.dot(P,  x2))
         M = np.array([[S11, S12],[S12, S22]], dtype=float)
         y = np.array([T1, T2], dtype=float)
         try:
-            a, b = np.linalg.solve(M, y)   # P ≈ a*I + b*I^2
+            a, b = np.linalg.solve(M, y)
         except np.linalg.LinAlgError:
             return np.nan, np.nan, np.nan
         yhat = a*I + b*(I**2)
@@ -227,9 +176,56 @@ plant["t"] = plant["t"] + pd.to_timedelta(best_lag, unit="s")
         r2 = 1 - (sse/sst) if sst > 0 else np.nan
         return a, b, r2
 
-    a_q, b_q, r2_quad = quad_fit_through_origin(valid["I"].values, valid["P"].values)
+    # ---- Lag compensation ----
+    st.markdown("### Lag compensation")
+    cLag1, cLag2, cLag3 = st.columns(3)
+    with cLag1:
+        auto_lag = st.checkbox("Auto-detect lag", value=True)
+    with cLag2:
+        max_lag_s = st.number_input("Max lag search (seconds)", min_value=0, value=120, step=5)
+    with cLag3:
+        manual_lag_s = st.number_input("Manual lag (seconds, + = plant delayed)", value=0, step=1)
 
-    # ---- Zero-intercept linear for reference ----
+    best_lag = manual_lag_s
+    if auto_lag:
+        lags = np.arange(-max_lag_s, max_lag_s+1, 5)
+        best_r2 = -np.inf
+        for lag in lags:
+            shifted = plant.copy()
+            shifted["t"] = shifted["t"] + pd.to_timedelta(lag, unit="s")
+            temp_join = pd.merge_asof(
+                ref, shifted, on="t", direction="nearest",
+                tolerance=pd.Timedelta(seconds=int(join_tol_s))
+            ).dropna(subset=["P", "I"])
+            temp_join = temp_join[
+                (temp_join["P"] >= p_min) &
+                (temp_join["I"] >= i_min) &
+                (temp_join["P"] <= clip_frac*p_max)
+            ]
+            if len(temp_join) > 3:
+                _, _, r2 = quad_fit_through_origin(temp_join["I"], temp_join["P"])
+                if np.isfinite(r2) and r2 > best_r2:
+                    best_r2 = r2
+                    best_lag = lag
+        st.caption(f"Auto-detected lag: {best_lag} s (R² {best_r2:.3f})")
+
+    # Apply lag before join
+    plant["t"] = plant["t"] + pd.to_timedelta(best_lag, unit="s")
+
+    # ---- Join data ----
+    tol = pd.Timedelta(seconds=int(join_tol_s))
+    joined = pd.merge_asof(ref, plant, on="t", direction="nearest", tolerance=tol)
+    joined = joined.dropna(subset=["P", "I"]).copy()
+
+    # ---- Mark valid points ----
+    clip_limit = clip_frac * float(p_max)
+    joined["sleep"] = (joined["P"] < float(p_min)) | (joined["I"] < float(i_min))
+    joined["clip"]  = (float(p_max) > 0) & (joined["P"] > clip_limit)
+    joined["valid"] = ~(joined["sleep"] | joined["clip"])
+    valid = joined.loc[joined["valid"]].copy()
+
+    # ---- Fit results ----
+    a_q, b_q, r2_quad = quad_fit_through_origin(valid["I"].values, valid["P"].values)
     sumPI = float((valid["P"] * valid["I"]).sum()) if len(valid) > 0 else 0.0
     sumI2 = float((valid["I"] * valid["I"]).sum()) if len(valid) > 0 else 0.0
     sumP2 = float((valid["P"] * valid["P"]).sum()) if len(valid) > 0 else 0.0
@@ -241,6 +237,12 @@ plant["t"] = plant["t"] + pd.to_timedelta(best_lag, unit="s")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Joined points", f"{len(joined)}")
     m2.metric("Valid points", f"{len(valid)}")
+    if len(joined) > 0:
+        t0, t1 = joined["t"].iloc[0], joined["t"].iloc[-1]
+        overlap_min = (t1 - t0).total_seconds() / 60.0
+    else:
+        t0 = t1 = None
+        overlap_min = 0.0
     ov = f"Start: {t0}\nEnd: {t1}\nDuration: {overlap_min:.1f} min" if t0 is not None else "—"
     m3.write("**Overlap window**"); m3.code(ov)
     guidance = (f"Overlap is ~{overlap_min:.1f} min. Try for ≥30–60 min; 90+ min mixed sun/cloud is best."
@@ -277,7 +279,6 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
         ax1.scatter(joined.loc[~joined["valid"], "I"], joined.loc[~joined["valid"], "P"], s=12, marker="x", label="sleep/clip")
     ax1.axhline(clip_limit, linestyle="--", linewidth=1)
     ax1.set_xlabel("Isc (A)"); ax1.set_ylabel("Power (W)")
-    # overlay linear & quadratic fits
     if np.isfinite(k_zero) and len(valid) > 0:
         xs_lin = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 2)
         ax1.plot(xs_lin, k_zero*xs_lin, linewidth=2, label="linear fit")
@@ -302,7 +303,7 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
         ax3.set_ylabel("Median k = P/I (W/A)")
     st.pyplot(fig3)
 
-    # ---------------- Time series (two axes) ----------------
+    # ---------------- Time series ----------------
     st.subheader("Time Series (joined order)")
     fig2, ax2 = plt.subplots(figsize=(6.5, 4.0))
     if not joined.empty:
