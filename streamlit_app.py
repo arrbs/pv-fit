@@ -1,8 +1,7 @@
 # streamlit_app.py
-# PV Fit Calibrator — single-slope + piecewise (two-segment) fit
-# Upload Ref(Isc vs time) + Plant(Power vs time), align by time,
-# filter sleep/clipping, fit k (zero-intercept) AND piecewise zero-intercept,
-# visualize, export joined CSV, and print HA YAML snippets.
+# PV Fit Calibrator — Quadratic (through-origin): P ≈ a*I + b*I^2
+# Load Ref(Isc vs time) + Plant(Power vs time), align by time, filter,
+# fit quadratic, visualize, export joined CSV, and print HA snippets.
 
 import io
 import numpy as np
@@ -10,16 +9,16 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="PV Fit Calibrator (Two CSVs → k / piecewise)", layout="wide")
+st.set_page_config(page_title="PV Fit Calibrator (Quadratic)", layout="wide")
 
-st.title("PV Fit Calibrator (Two CSVs → k / piecewise)")
+st.title("PV Fit Calibrator — Quadratic (through-origin)")
 st.write("""
 Upload **two CSV files**:
 1) **Reference CSV** with *Isc (A)* vs *time*  
 2) **Plant CSV** with *Power (W)* vs *time*
 
 We align timestamps (nearest within tolerance), exclude sleep/clipping,
-fit **k** with a through-origin model (**P ≈ k·Isc**), and optionally a **two-segment** through-origin model.
+fit a **quadratic through-origin model**: **P ≈ a·I + b·I²**, and emit an HA snippet.
 """)
 
 # ---------------- Helpers ----------------
@@ -131,7 +130,7 @@ with cD:
 with cE:
     join_tol_s = st.number_input("Join tolerance (seconds)", min_value=0, value=60, step=5)
 
-st.caption("Valid points must satisfy: P ≥ Pmin, I ≥ Imin, and P ≤ (clip × Pmax). Timestamps are aligned by nearest within the tolerance.")
+st.caption("Valid points: P ≥ Pmin, I ≥ Imin, and P ≤ (clip × Pmax). Timestamps aligned by nearest within tolerance.")
 
 # ---------------- Compute ----------------
 ready = (not ref_df.empty) and (not plant_df.empty)
@@ -170,59 +169,38 @@ if ready:
     joined["valid"] = ~(joined["sleep"] | joined["clip"])
     valid = joined.loc[joined["valid"]].copy()
 
-    # ---- single-slope through-origin ----
+    # ---- Quadratic (through-origin): P ≈ a*I + b*I^2 ----
+    def quad_fit_through_origin(I, P):
+        I = np.asarray(I); P = np.asarray(P)
+        if len(I) < 3:
+            return np.nan, np.nan, np.nan
+        x1 = I
+        x2 = I**2
+        S11 = float(np.dot(x1, x1))        # sum I^2
+        S12 = float(np.dot(x1, x2))        # sum I^3
+        S22 = float(np.dot(x2, x2))        # sum I^4
+        T1  = float(np.dot(P,  x1))        # sum P*I
+        T2  = float(np.dot(P,  x2))        # sum P*I^2
+        M = np.array([[S11, S12],[S12, S22]], dtype=float)
+        y = np.array([T1, T2], dtype=float)
+        try:
+            a, b = np.linalg.solve(M, y)   # P ≈ a*I + b*I^2
+        except np.linalg.LinAlgError:
+            return np.nan, np.nan, np.nan
+        yhat = a*I + b*(I**2)
+        sst = float(((P - P.mean())**2).sum())
+        sse = float(((P - yhat)**2).sum())
+        r2 = 1 - (sse/sst) if sst > 0 else np.nan
+        return a, b, r2
+
+    a_q, b_q, r2_quad = quad_fit_through_origin(valid["I"].values, valid["P"].values)
+
+    # ---- Zero-intercept linear for reference ----
     sumPI = float((valid["P"] * valid["I"]).sum()) if len(valid) > 0 else 0.0
     sumI2 = float((valid["I"] * valid["I"]).sum()) if len(valid) > 0 else 0.0
     sumP2 = float((valid["P"] * valid["P"]).sum()) if len(valid) > 0 else 0.0
     k_zero = (sumPI / sumI2) if sumI2 > 0 else np.nan
     r2_zero = ((sumPI * sumPI) / (sumP2 * sumI2)) if (sumP2 > 0 and sumI2 > 0) else np.nan
-
-    # ---- OLS with intercept (for reference) ----
-    if len(valid) >= 2:
-        I = valid["I"].values
-        P = valid["P"].values
-        I_mean, P_mean = I.mean(), P.mean()
-        sxx = ((I - I_mean) ** 2).sum()
-        sxy = ((I - I_mean) * (P - P_mean)).sum()
-        syy = ((P - P_mean) ** 2).sum()
-        k_ols = sxy / sxx if sxx > 0 else np.nan
-        a_ols = P_mean - k_ols * I_mean if np.isfinite(k_ols) else np.nan
-        r2_ols = (sxy * sxy) / (sxx * syy) if (sxx > 0 and syy > 0) else np.nan
-    else:
-        k_ols = a_ols = r2_ols = np.nan
-
-    # ---- piecewise through-origin (automated breakpoint) ----
-    def piecewise_zero_intercept(I, P, n_grid=40, min_frac=0.10, max_frac=0.90):
-        if len(I) < 40:
-            return np.nan, np.nan, np.nan, np.nan
-        order = np.argsort(I)
-        I, P = I[order], P[order]
-        n = len(I)
-        lo = int(n * min_frac)
-        hi = int(n * max_frac)
-        idxs = np.linspace(lo, hi, num=min(n_grid, max(hi - lo, 3)), dtype=int)
-        best_sse = np.inf
-        best = (np.nan, np.nan, np.nan, np.nan)
-        sst = ((P - P.mean())**2).sum()
-        for j in idxs:
-            I1, P1 = I[:j], P[:j]
-            I2, P2 = I[j:], P[j:]
-            sI2_1 = (I1**2).sum(); sPI_1 = (P1*I1).sum()
-            sI2_2 = (I2**2).sum(); sPI_2 = (P2*I2).sum()
-            if sI2_1 <= 0 or sI2_2 <= 0:
-                continue
-            k1 = sPI_1 / sI2_1
-            k2 = sPI_2 / sI2_2
-            sse = ((P1 - k1*I1)**2).sum() + ((P2 - k2*I2)**2).sum()
-            if sse < best_sse:
-                r2_pw = 1 - (sse / sst) if sst > 0 else np.nan
-                best_sse = sse
-                best = (I[j], k1, k2, r2_pw)
-        return best
-
-    I_vals = valid["I"].values if len(valid) else np.array([])
-    P_vals = valid["P"].values if len(valid) else np.array([])
-    I_break, k1_pw, k2_pw, r2_pw = piecewise_zero_intercept(I_vals, P_vals)
 
     # ---------------- KPIs ----------------
     st.markdown("### 4) Results")
@@ -231,49 +209,28 @@ if ready:
     m2.metric("Valid points", f"{len(valid)}")
     ov = f"Start: {t0}\nEnd: {t1}\nDuration: {overlap_min:.1f} min" if t0 is not None else "—"
     m3.write("**Overlap window**"); m3.code(ov)
-    guidance = (f"Overlap is ~{overlap_min:.1f} min. Try for ≥30–60 min; 90+ min with mixed sun/cloud is best."
+    guidance = (f"Overlap is ~{overlap_min:.1f} min. Try for ≥30–60 min; 90+ min mixed sun/cloud is best."
                 if overlap_min < 30 else f"Overlap is ~{overlap_min:.1f} min. Looks good.")
     m4.write("**Guidance**"); m4.info(guidance)
     if len(valid) < 50:
-        st.warning("Very few valid points (<50). k may be unreliable—collect a longer or more varied window.")
+        st.warning("Very few valid points (<50). Quadratic may be unreliable—collect a longer or more varied window.")
 
-    kcol, ocol, pcol = st.columns(3)
-    # single slope
-    kcol.write("**k (zero-intercept)**")
-    kcol.subheader(f"{k_zero:,.3f} W/A" if np.isfinite(k_zero) else "—")
-    kcol.caption(f"R² (zero-intercept): {r2_zero:.3f}" if np.isfinite(r2_zero) else "R²: —")
-    # OLS
-    ocol.write("**OLS with intercept**")
-    ocol.write(f"kₑ: {k_ols:,.3f} W/A" if np.isfinite(k_ols) else "kₑ: —")
-    ocol.write(f"a (intercept): {a_ols:,.3f} W" if np.isfinite(a_ols) else "a: —")
-    ocol.caption(f"R²: {r2_ols:.3f}" if np.isfinite(r2_ols) else "R²: —")
-    # piecewise
-    pcol.write("**Piecewise (two-segment, through-origin)**")
-    pcol.write(f"I* (break): {I_break:,.3f} A" if np.isfinite(I_break) else "I*: —")
-    pcol.write(f"k₁: {k1_pw:,.0f} W/A" if np.isfinite(k1_pw) else "k₁: —")
-    pcol.write(f"k₂: {k2_pw:,.0f} W/A" if np.isfinite(k2_pw) else "k₂: —")
-    pcol.caption(f"R² (piecewise): {r2_pw:.3f}" if np.isfinite(r2_pw) else "R²: —")
+    q1, q2, q3 = st.columns(3)
+    q1.write("**a (W/A)**"); q1.subheader(f"{a_q:,.3f}" if np.isfinite(a_q) else "—")
+    q2.write("**b (W/A²)**"); q2.subheader(f"{b_q:,.3f}" if np.isfinite(b_q) else "—")
+    q3.caption(f"R² (quadratic): {r2_quad:.3f}" if np.isfinite(r2_quad) else "R²: —")
 
-    # ---------- ESPHome & HA snippets ----------
-    st.markdown("#### Home Assistant snippet (single k)")
-    if np.isfinite(k_zero):
+    kcol = st.columns(1)[0]
+    kcol.caption(f"Linear reference k: {k_zero:,.3f} W/A (R² {r2_zero:.3f})" if np.isfinite(k_zero) else "Linear reference k: —")
+
+    st.markdown("#### Home Assistant snippet (quadratic)")
+    if np.isfinite(a_q) and np.isfinite(b_q):
         st.code(
-f"""# Template state for 'PV Power Available (expected)'
-{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
-{{% set k = {k_zero:.3f} %}}
-{{{{ (k * isc) | round(0) }}}}
-""", language="jinja2")
-
-    st.markdown("#### Home Assistant snippet (piecewise)")
-    if np.isfinite(I_break) and np.isfinite(k1_pw) and np.isfinite(k2_pw):
-        st.code(
-f"""# Piecewise template (I*={I_break:.3f} A, k1={k1_pw:.0f}, k2={k2_pw:.0f})
-{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
-{{% set i_break = {I_break:.6f} %}}
-{{% set k1 = {k1_pw:.3f} %}}
-{{% set k2 = {k2_pw:.3f} %}}
-{{{{ ( (k1 if isc < i_break else k2) * isc ) | round(0) }}}}
-""", language="jinja2")
+f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
+{{% set a = {a_q:.6f} %}}
+{{% set b = {b_q:.6f} %}}
+{{% set p = a*isc + b*isc*isc %}}
+{{{{ (0 if p < 0 else p) | round(0) }}}}""", language="jinja2")
 
     st.markdown("---")
 
@@ -286,22 +243,13 @@ f"""# Piecewise template (I*={I_break:.3f} A, k1={k1_pw:.0f}, k2={k2_pw:.0f})
         ax1.scatter(joined.loc[~joined["valid"], "I"], joined.loc[~joined["valid"], "P"], s=12, marker="x", label="sleep/clip")
     ax1.axhline(clip_limit, linestyle="--", linewidth=1)
     ax1.set_xlabel("Isc (A)"); ax1.set_ylabel("Power (W)")
-
-    # overlay single k
+    # overlay linear & quadratic fits
     if np.isfinite(k_zero) and len(valid) > 0:
-        i_min, i_max = float(valid["I"].min()), float(valid["I"].max())
-        xs = np.linspace(i_min, i_max, 2)
-        ax1.plot(xs, k_zero*xs, linewidth=2, label="fit k")
-
-    # overlay piecewise
-    if np.isfinite(I_break) and np.isfinite(k1_pw) and np.isfinite(k2_pw) and len(valid) > 0:
-        i_min, i_max = float(valid["I"].min()), float(valid["I"].max())
-        xs1 = np.linspace(i_min, I_break, 2)
-        xs2 = np.linspace(I_break, i_max, 2)
-        ax1.plot(xs1, k1_pw*xs1, linewidth=2, label="fit k₁")
-        ax1.plot(xs2, k2_pw*xs2, linewidth=2, label="fit k₂")
-        ax1.axvline(I_break, linestyle=":", linewidth=1)
-
+        xs_lin = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 2)
+        ax1.plot(xs_lin, k_zero*xs_lin, linewidth=2, label="linear fit")
+    if np.isfinite(a_q) and np.isfinite(b_q) and len(valid) > 0:
+        xi = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 200)
+        ax1.plot(xi, a_q*xi + b_q*(xi**2), linewidth=2, label="quadratic fit")
     ax1.legend()
     st.pyplot(fig1)
 
@@ -316,8 +264,6 @@ f"""# Piecewise template (I*={I_break:.3f} A, k1={k1_pw:.0f}, k2={k2_pw:.0f})
         df["bin"] = pd.qcut(df["I"], q=bins, duplicates="drop")
         prof = df.groupby("bin").agg(I_mid=("I","median"), k_med=("k_inst","median")).dropna()
         ax3.plot(prof["I_mid"], prof["k_med"], marker="o", linewidth=1)
-        if np.isfinite(I_break):
-            ax3.axvline(I_break, linestyle=":", linewidth=1)
         ax3.set_xlabel("Isc (A)")
         ax3.set_ylabel("Median k = P/I (W/A)")
     st.pyplot(fig3)
