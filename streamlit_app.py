@@ -130,6 +130,9 @@ with cD:
 with cE:
     join_tol_s = st.number_input("Join tolerance (seconds)", min_value=0, value=60, step=5)
 
+with st.expander("Advanced settings"):
+    bias_watts = st.number_input("Bias margin (subtract W from curve)", value=0.0, step=10.0)
+
 st.caption("Valid points: P ≥ Pmin, I ≥ Imin, and P ≤ (clip × Pmax). Timestamps aligned by nearest within tolerance.")
 
 # ---------------- Compute ----------------
@@ -188,7 +191,7 @@ if ready:
 
     best_lag = manual_lag_s
     if auto_lag:
-        lags = np.arange(-max_lag_s, max_lag_s+1, 5)
+        lags = np.arange(-max_lag_s, max_lag_s + 1, 5)  # 5s step
         best_r2 = -np.inf
         for lag in lags:
             shifted = plant.copy()
@@ -197,13 +200,22 @@ if ready:
                 ref, shifted, on="t", direction="nearest",
                 tolerance=pd.Timedelta(seconds=int(join_tol_s))
             ).dropna(subset=["P", "I"])
+
+            # Hard filters (avoid sleep and clipping)
             temp_join = temp_join[
                 (temp_join["P"] >= p_min) &
                 (temp_join["I"] >= i_min) &
-                (temp_join["P"] <= clip_frac*p_max)
+                (temp_join["P"] <= clip_frac * p_max)
             ]
+
             if len(temp_join) > 3:
-                _, _, r2 = quad_fit_through_origin(temp_join["I"], temp_join["P"])
+                # Focus on mid-range current to avoid extremes
+                q20, q80 = temp_join["I"].quantile(0.2), temp_join["I"].quantile(0.8)
+                mid = temp_join[temp_join["I"].between(q20, q80)]
+                if len(mid) > 3:
+                    _, _, r2 = quad_fit_through_origin(mid["I"], mid["P"])
+                else:
+                    _, _, r2 = quad_fit_through_origin(temp_join["I"], temp_join["P"])
                 if np.isfinite(r2) and r2 > best_r2:
                     best_r2 = r2
                     best_lag = lag
@@ -226,6 +238,12 @@ if ready:
 
     # ---- Fit results ----
     a_q, b_q, r2_quad = quad_fit_through_origin(valid["I"].values, valid["P"].values)
+
+    # Biased fit curve
+    def biased_curve(I):
+        return np.maximum(0, (a_q * I + b_q * (I ** 2)) - bias_watts)
+
+    # Zero-intercept linear reference
     sumPI = float((valid["P"] * valid["I"]).sum()) if len(valid) > 0 else 0.0
     sumI2 = float((valid["I"] * valid["I"]).sum()) if len(valid) > 0 else 0.0
     sumP2 = float((valid["P"] * valid["P"]).sum()) if len(valid) > 0 else 0.0
@@ -259,13 +277,14 @@ if ready:
     kcol = st.columns(1)[0]
     kcol.caption(f"Linear reference k: {k_zero:,.3f} W/A (R² {r2_zero:.3f})" if np.isfinite(k_zero) else "Linear reference k: —")
 
-    st.markdown("#### Home Assistant snippet (quadratic)")
+    st.markdown("#### Home Assistant snippet (quadratic with bias)")
     if np.isfinite(a_q) and np.isfinite(b_q):
         st.code(
 f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
 {{% set a = {a_q:.6f} %}}
 {{% set b = {b_q:.6f} %}}
-{{% set p = a*isc + b*isc*isc %}}
+{{% set bias = {bias_watts:.1f} %}}
+{{% set p = (a*isc + b*isc*isc) - bias %}}
 {{{{ (0 if p < 0 else p) | round(0) }}}}""", language="jinja2")
 
     st.markdown("---")
@@ -279,12 +298,15 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
         ax1.scatter(joined.loc[~joined["valid"], "I"], joined.loc[~joined["valid"], "P"], s=12, marker="x", label="sleep/clip")
     ax1.axhline(clip_limit, linestyle="--", linewidth=1)
     ax1.set_xlabel("Isc (A)"); ax1.set_ylabel("Power (W)")
+    # overlay linear & quadratic fits
     if np.isfinite(k_zero) and len(valid) > 0:
         xs_lin = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 2)
-        ax1.plot(xs_lin, k_zero*xs_lin, linewidth=2, label="linear fit")
+        ax1.plot(xs_lin, k_zero * xs_lin, linewidth=2, label="linear fit")
     if np.isfinite(a_q) and np.isfinite(b_q) and len(valid) > 0:
         xi = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 200)
-        ax1.plot(xi, a_q*xi + b_q*(xi**2), linewidth=2, label="quadratic fit")
+        ax1.plot(xi, a_q * xi + b_q * (xi ** 2), linewidth=2, label="quadratic fit")
+        if bias_watts > 0:
+            ax1.plot(xi, biased_curve(xi), linewidth=2, linestyle="--", color="orange", label=f"biased fit (-{bias_watts} W)")
     ax1.legend()
     st.pyplot(fig1)
 
@@ -293,7 +315,7 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
     fig3, ax3 = plt.subplots(figsize=(6.5, 4.0))
     if len(valid) > 0:
         df = valid[["I","P"]].copy()
-        df = df[(df["I"]>0) & (df["P"]>0)]
+        df = df[(df["I"] > 0) & (df["P"] > 0)]
         df["k_inst"] = df["P"] / df["I"]
         bins = 24
         df["bin"] = pd.qcut(df["I"], q=bins, duplicates="drop")
@@ -303,7 +325,7 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
         ax3.set_ylabel("Median k = P/I (W/A)")
     st.pyplot(fig3)
 
-    # ---------------- Time series ----------------
+    # ---------------- Time series (joined order) ----------------
     st.subheader("Time Series (joined order)")
     fig2, ax2 = plt.subplots(figsize=(6.5, 4.0))
     if not joined.empty:
