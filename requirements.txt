@@ -3,3 +3,4 @@ numpy
 pandas
 matplotlib
 plotly>=5.0.0
+streamlit-plotly-events>=0.0.6
