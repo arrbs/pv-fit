@@ -8,6 +8,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.express as px
+from streamlit_plotly_events import plotly_events
 
 st.set_page_config(page_title="PV Fit Calibrator (Quadratic)", layout="wide")
 
@@ -134,7 +137,7 @@ with st.expander("Advanced settings"):
     bias_watts = st.number_input("Bias margin (subtract W from targets & refit)", value=0.0, step=10.0, help="Refits to P' = max(P - bias, 0). Produces new a,b.")
     st.caption("Bias reduces predictions on purpose; expect lower R² vs original P.")
 
-st.caption("Valid points: P ≥ Pmin, I ≥ Imin, and P ≤ (clip × Pmax). Timestamps aligned by nearest within tolerance.")
+st.caption("Valid points: P ≥ Pmin, I ≥ Imin, P ≤ (clip × Pmax), and not manually excluded. Timestamps aligned by nearest within tolerance.")
 
 # ---------------- Compute ----------------
 ready = (not ref_df.empty) and (not plant_df.empty)
@@ -253,7 +256,15 @@ if ready:
     clip_limit = clip_frac * float(p_max)
     joined["sleep"] = (joined["P"] < float(p_min)) | (joined["I"] < float(i_min))
     joined["clip"]  = (float(p_max) > 0) & (joined["P"] > clip_limit)
-    joined["valid"] = ~(joined["sleep"] | joined["clip"])
+    joined["auto_valid"] = ~(joined["sleep"] | joined["clip"])
+    
+    # Initialize session state for manual exclusions
+    if "manually_excluded_indices" not in st.session_state:
+        st.session_state.manually_excluded_indices = set()
+    
+    # Create a manual exclusion mask
+    joined["manually_excluded"] = joined.index.isin(st.session_state.manually_excluded_indices)
+    joined["valid"] = joined["auto_valid"] & ~joined["manually_excluded"]
     valid = joined.loc[joined["valid"]].copy()
 
     # ---- Fit: un-biased vs biased ----
@@ -285,6 +296,8 @@ if ready:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Joined points", f"{len(joined)}")
     m2.metric("Valid points", f"{len(valid)}")
+    num_manually_excluded = len(st.session_state.manually_excluded_indices)
+    m3.metric("Manually excluded", f"{num_manually_excluded}")
     if len(joined) > 0:
         t0, t1 = joined["t"].iloc[0], joined["t"].iloc[-1]
         overlap_min = (t1 - t0).total_seconds() / 60.0
@@ -292,10 +305,13 @@ if ready:
         t0 = t1 = None
         overlap_min = 0.0
     ov = f"Start: {t0}\nEnd: {t1}\nDuration: {overlap_min:.1f} min" if t0 is not None else "—"
-    m3.write("**Overlap window**"); m3.code(ov)
+    m4.write("**Overlap window**"); m4.code(ov)
+    
+    # Add guidance in a separate row
+    st.markdown("---")
     guidance = (f"Overlap is ~{overlap_min:.1f} min. Try for ≥30–60 min; 90+ min mixed sun/cloud is best."
                 if overlap_min < 30 else f"Overlap is ~{overlap_min:.1f} min. Looks good.")
-    m4.write("**Guidance**"); m4.info(guidance)
+    st.info(guidance)
     if len(valid) < 50:
         st.warning("Very few valid points (<50). Quadratic may be unreliable—collect a longer or more varied window.")
 
@@ -335,24 +351,135 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
 
     st.markdown("---")
 
-    # ---------------- Scatter ----------------
-    st.subheader("Scatter: Plant Power (W) vs Ref Isc (A)")
-    fig1, ax1 = plt.subplots(figsize=(6.5, 4.0))
+    # ---------------- Interactive Scatter ----------------
+    st.subheader("Interactive Scatter: Plant Power (W) vs Ref Isc (A)")
+    st.caption("💡 Use the box select or lasso select tools to select points for exclusion. Selected points will be removed from the fit.")
+    
+    # UI controls for manual exclusions
+    col_clear, col_info = st.columns([1, 3])
+    with col_clear:
+        if st.button("Clear Manual Exclusions", type="secondary"):
+            st.session_state.manually_excluded_indices = set()
+            st.rerun()
+    with col_info:
+        num_excluded = len(st.session_state.manually_excluded_indices)
+        if num_excluded > 0:
+            st.info(f"📋 {num_excluded} points manually excluded from fit")
+
+    # Create interactive scatter plot with Plotly
+    fig = go.Figure()
+    
+    # Add valid points
     if len(valid) > 0:
-        ax1.scatter(valid["I"], valid["P"], s=12, label="valid")
-    if len(joined) > 0 and len(valid) < len(joined):
-        ax1.scatter(joined.loc[~joined["valid"], "I"], joined.loc[~joined["valid"], "P"], s=12, marker="x", label="sleep/clip")
-    ax1.axhline(clip_limit, linestyle="--", linewidth=1)
-    ax1.set_xlabel("Isc (A)"); ax1.set_ylabel("Power (W)")
-    # overlay fits
+        fig.add_trace(go.Scatter(
+            x=valid["I"], 
+            y=valid["P"], 
+            mode='markers',
+            marker=dict(size=6, color='blue', opacity=0.7),
+            name='Valid points',
+            customdata=valid.index,
+            hovertemplate='I: %{x:.3f} A<br>P: %{y:.1f} W<br>Index: %{customdata}<extra></extra>'
+        ))
+    
+    # Add automatically excluded points (sleep/clip)  
+    auto_excluded = joined.loc[~joined["auto_valid"] & ~joined["manually_excluded"]]
+    if len(auto_excluded) > 0:
+        fig.add_trace(go.Scatter(
+            x=auto_excluded["I"], 
+            y=auto_excluded["P"], 
+            mode='markers',
+            marker=dict(size=6, color='red', symbol='x', opacity=0.7),
+            name='Sleep/clip (auto excluded)',
+            customdata=auto_excluded.index,
+            hovertemplate='I: %{x:.3f} A<br>P: %{y:.1f} W<br>Index: %{customdata}<br>Reason: Sleep/Clip<extra></extra>'
+        ))
+    
+    # Add manually excluded points
+    manual_excluded = joined.loc[joined["manually_excluded"]]
+    if len(manual_excluded) > 0:
+        fig.add_trace(go.Scatter(
+            x=manual_excluded["I"], 
+            y=manual_excluded["P"], 
+            mode='markers',
+            marker=dict(size=8, color='orange', symbol='x', opacity=0.8),
+            name='Manually excluded',
+            customdata=manual_excluded.index,
+            hovertemplate='I: %{x:.3f} A<br>P: %{y:.1f} W<br>Index: %{customdata}<br>Reason: Manual exclusion<extra></extra>'
+        ))
+    
+    # Add clip limit line
+    if len(joined) > 0:
+        i_min_plot = float(joined["I"].min())
+        i_max_plot = float(joined["I"].max())
+        fig.add_trace(go.Scatter(
+            x=[i_min_plot, i_max_plot], 
+            y=[clip_limit, clip_limit],
+            mode='lines',
+            line=dict(dash='dash', color='gray', width=1),
+            name=f'Clip limit ({clip_limit:.0f} W)',
+            showlegend=True
+        ))
+    
+    # Add fit curves
     if np.isfinite(a_q) and np.isfinite(b_q) and len(valid) > 0:
         xi = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 200)
-        ax1.plot(xi, a_q*xi + b_q*(xi**2), linewidth=2, label="quadratic fit")
+        yi_quad = a_q*xi + b_q*(xi**2)
+        fig.add_trace(go.Scatter(
+            x=xi, y=yi_quad,
+            mode='lines',
+            line=dict(color='blue', width=3),
+            name='Quadratic fit'
+        ))
+    
     if np.isfinite(a_b) and np.isfinite(b_b) and len(valid) > 0:
         xi = np.linspace(float(valid["I"].min()), float(valid["I"].max()), 200)
-        ax1.plot(xi, a_b*xi + b_b*(xi**2), linewidth=2, linestyle="--", label=f"biased fit (targets −{bias_watts:.0f} W)")
-    ax1.legend()
-    st.pyplot(fig1)
+        yi_biased = a_b*xi + b_b*(xi**2)
+        fig.add_trace(go.Scatter(
+            x=xi, y=yi_biased,
+            mode='lines',
+            line=dict(color='blue', width=3, dash='dash'),
+            name=f'Biased fit (targets −{bias_watts:.0f} W)'
+        ))
+    
+    # Configure layout
+    fig.update_layout(
+        xaxis_title="Isc (A)",
+        yaxis_title="Power (W)", 
+        height=500,
+        dragmode='select',  # Enable box select by default
+        hovermode='closest',
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        )
+    )
+    
+    # Handle selection events
+    selected_points = plotly_events(
+        fig, 
+        click_event=False, 
+        hover_event=False,
+        select_event=True,
+        override_height=500,
+        key="scatter_plot"
+    )
+    
+    # Process selection to exclude points
+    if selected_points:
+        # Get indices of selected points
+        selected_indices = set()
+        for point in selected_points:
+            if 'customdata' in point and point['customdata'] is not None:
+                selected_indices.add(point['customdata'])
+        
+        if selected_indices:
+            # Only include points that are currently valid (not already excluded)
+            valid_selected = selected_indices & set(joined.loc[joined["auto_valid"]].index)
+            if valid_selected:
+                st.session_state.manually_excluded_indices.update(valid_selected)
+                st.rerun()
 
     # ---------------- Instantaneous slope profile ----------------
     st.subheader("Instantaneous slope profile: median(P/I) vs Isc")
@@ -386,7 +513,7 @@ f"""{{% set isc = states('sensor.ref_pv_probe_8266_ref_pv_isc')|float(0) %}}
     # ---------------- Export cleaned/joined CSV ----------------
     st.markdown("### Export cleaned/joined data")
     if not joined.empty:
-        out = joined[["t", "I", "P", "valid", "sleep", "clip"]].copy()
+        out = joined[["t", "I", "P", "valid", "sleep", "clip", "manually_excluded"]].copy()
         csv_bytes = out.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download joined dataset (CSV)",
